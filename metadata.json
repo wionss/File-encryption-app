@@ -1,0 +1,5 @@
+{
+  "name": "SecureFile Crypt",
+  "description": "A high-security local-first web application to encrypt and decrypt files using any other file as a unique cryptographic key. Privacy-focused with all processing happening entirely in your browser.",
+  "requestFramePermissions": []
+}
