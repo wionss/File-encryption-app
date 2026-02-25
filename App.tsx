@@ -104,6 +104,10 @@ const TRANSLATIONS = {
       {
         title: "Why use a Physical Key?",
         text: "It's like a real-world key. Even if someone knows your password, they can't unlock your files without the exact same file you used as a key."
+      },
+      {
+        title: "Strict Privacy & Offline Mode",
+        text: "This app is 100% local. Your files never leave your computer. You can use it without internet. 'Strict Privacy Mode' disables all network calls (AI tips) for maximum security."
       }
     ],
     vault: {
@@ -131,7 +135,10 @@ const TRANSLATIONS = {
       factoryReset: "Factory Reset",
       factoryResetDesc: "This will permanently delete ALL stored passwords and your Master Key. This action cannot be undone.",
       confirmReset: "I understand, delete everything",
-      cancelReset: "Cancel"
+      cancelReset: "Cancel",
+      strictPrivacy: "Strict Privacy Mode",
+      strictPrivacyDesc: "Disable all network calls (AI tips). Maximum security.",
+      privacyStatus: "Security Status"
     },
     ariaLabels: {
       helpButton: "Open help information",
@@ -228,6 +235,10 @@ const TRANSLATIONS = {
       {
         title: "¿Por qué usar una Llave Física?",
         text: "Es como una llave real. Aunque alguien sepa tu contraseña, no podrá abrir tus archivos sin el archivo exacto que usaste como llave."
+      },
+      {
+        title: "Privacidad Estricta y Modo Offline",
+        text: "Esta app es 100% local. Tus archivos nunca salen de tu PC. Puedes usarla sin internet. El 'Modo Privacidad Estricta' desactiva cualquier llamada de red (IA) para máxima seguridad."
       }
     ],
     vault: {
@@ -255,7 +266,10 @@ const TRANSLATIONS = {
       factoryReset: "Restablecimiento de Fábrica",
       factoryResetDesc: "Esto eliminará permanentemente TODAS las contraseñas guardadas y tu Clave Maestra. Esta acción no se puede deshacer.",
       confirmReset: "Entiendo, borrar todo",
-      cancelReset: "Cancelar"
+      cancelReset: "Cancelar",
+      strictPrivacy: "Modo Privacidad Estricta",
+      strictPrivacyDesc: "Desactiva todas las llamadas de red (IA). Máxima seguridad.",
+      privacyStatus: "Estado de Seguridad"
     },
     ariaLabels: {
       helpButton: "Abrir ayuda",
@@ -308,6 +322,7 @@ const App: React.FC = () => {
   const [isVaultOpen, setIsVaultOpen] = useState(false);
   const [isVaultMenuOpen, setIsVaultMenuOpen] = useState(false);
   const [isResetModalOpen, setIsResetModalOpen] = useState(false);
+  const [strictPrivacy, setStrictPrivacy] = useState<boolean>(() => localStorage.getItem('strict_privacy') === 'true');
   const [vaultSearch, setVaultSearch] = useState("");
   const [vault, setVault] = useState<VaultEntry[]>([]);
   
@@ -404,6 +419,10 @@ const App: React.FC = () => {
   useEffect(() => {
     localStorage.setItem('lang', lang);
   }, [lang]);
+
+  useEffect(() => {
+    localStorage.setItem('strict_privacy', String(strictPrivacy));
+  }, [strictPrivacy]);
 
   // Click outside vault handler
   useEffect(() => {
@@ -710,19 +729,43 @@ const App: React.FC = () => {
   const getSecurityInsight = useCallback(async () => {
     if (!keyFile) return;
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-      const prompt = lang === 'en' 
-        ? "Explain in one short, helpful sentence why combining a physical file key with a master password provides 'multi-factor' security for local file storage."
-        : "Explica en una frase corta y útil por qué combinar un archivo clave físico con una contraseña maestra proporciona seguridad de 'doble factor' para el almacenamiento local.";
-      const response = await ai.models.generateContent({
-        model: 'gemini-3-flash-preview',
-        contents: prompt,
-        config: {
-          systemInstruction: lang === 'en' ? "Friendly cybersecurity mentor." : "Mentor amigable de ciberseguridad."
-        }
-      });
-      setSecurityTip(response.text || "");
-    } catch (e) {}
+      // Local fallbacks in case of no internet or API failure
+      const localTips = lang === 'en' 
+        ? [
+            "A physical key file acts as a 'something you have' factor, making your encryption significantly harder to breach.",
+            "Using a large image or document as a key file increases entropy and security.",
+            "Remember: without this specific key file, your encrypted data cannot be recovered even with the password.",
+            "Combining a file key with a master password creates a true multi-factor encryption layer."
+          ]
+        : [
+            "Un archivo clave físico actúa como un factor de 'algo que tienes', haciendo que tu cifrado sea mucho más difícil de vulnerar.",
+            "Usar una imagen grande o un documento complejo como archivo clave aumenta la entropía y la seguridad.",
+            "Recuerda: sin este archivo clave específico, tus datos cifrados no podrán recuperarse ni siquiera con la contraseña.",
+            "Combinar una clave de archivo con una contraseña maestra crea una verdadera capa de cifrado de doble factor."
+          ];
+      
+      const randomLocalTip = localTips[Math.floor(Math.random() * localTips.length)];
+      setSecurityTip(randomLocalTip);
+
+      // Try to get a fresh AI tip if online AND NOT in strict privacy mode
+      if (typeof navigator !== 'undefined' && navigator.onLine && !strictPrivacy) {
+        const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+        const prompt = lang === 'en' 
+          ? "Explain in one short, helpful sentence why combining a physical file key with a master password provides 'multi-factor' security for local file storage."
+          : "Explica en una frase corta y útil por qué combinar un archivo clave físico con una contraseña maestra proporciona seguridad de 'doble factor' para el almacenamiento local.";
+        
+        const response = await ai.models.generateContent({
+          model: 'gemini-3-flash-preview',
+          contents: prompt,
+          config: {
+            systemInstruction: lang === 'en' ? "Friendly cybersecurity mentor." : "Mentor amigable de ciberseguridad."
+          }
+        });
+        if (response.text) setSecurityTip(response.text);
+      }
+    } catch (e) {
+      // Fallback already set above
+    }
   }, [keyFile, lang]);
 
   useEffect(() => {
@@ -852,6 +895,18 @@ const App: React.FC = () => {
                             {t.vault.lockVault}
                           </button>
                         )}
+                        <button 
+                          onClick={() => setStrictPrivacy(!strictPrivacy)}
+                          className="w-full flex items-center justify-between px-3 py-2 text-[11px] font-bold text-slate-300 hover:text-white hover:bg-white/5 rounded-lg transition-all"
+                        >
+                          <div className="flex items-center gap-3">
+                            <Shield size={14} className={strictPrivacy ? "text-emerald-400" : "text-slate-500"} />
+                            {t.vault.strictPrivacy}
+                          </div>
+                          <div className={`w-6 h-3 rounded-full relative transition-colors ${strictPrivacy ? 'bg-emerald-500' : 'bg-slate-700'}`}>
+                            <div className={`absolute top-0.5 w-2 h-2 bg-white rounded-full transition-all ${strictPrivacy ? 'left-3.5' : 'left-0.5'}`} />
+                          </div>
+                        </button>
                         <button 
                           onClick={() => setIsResetModalOpen(true)} 
                           className="w-full flex items-center gap-3 px-3 py-2 text-[11px] font-bold text-red-400 hover:text-red-300 hover:bg-red-500/5 rounded-lg transition-all"
@@ -1128,9 +1183,19 @@ const App: React.FC = () => {
             </div>
 
             {securityTip && (
-              <div className="mb-8 p-4 bg-blue-500/10 border border-blue-500/20 rounded-xl flex gap-3 items-start animate-in fade-in duration-500">
-                <ShieldAlert className="text-blue-400 mt-1" size={18} />
-                <p className="text-xs text-blue-200/80 italic leading-relaxed">"{securityTip}"</p>
+              <div className="mb-8 p-4 bg-blue-500/10 border border-blue-500/20 rounded-xl flex gap-3 items-start animate-in fade-in duration-500 relative overflow-hidden">
+                {strictPrivacy && (
+                  <div className="absolute top-0 right-0 p-2 opacity-20">
+                    <Shield size={40} className="text-emerald-500" />
+                  </div>
+                )}
+                <ShieldAlert className={strictPrivacy ? "text-emerald-400 mt-1" : "text-blue-400 mt-1"} size={18} />
+                <div className="flex flex-col gap-1">
+                  <p className="text-xs text-blue-200/80 italic leading-relaxed">"{securityTip}"</p>
+                  {strictPrivacy && (
+                    <span className="text-[8px] uppercase font-black text-emerald-500/50 tracking-tighter">Offline Protection Active</span>
+                  )}
+                </div>
               </div>
             )}
 
