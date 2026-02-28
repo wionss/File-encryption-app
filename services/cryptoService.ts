@@ -9,14 +9,14 @@ const SALT_SIZE = 16;
 const IV_SIZE = 12;
 const TAG_SIZE = 16;
 const CHUNK_SIZE = 1024 * 1024; // 1MB chunks for streaming
-const MAGIC_V2 = new TextEncoder().encode("SECUREV2"); // Legacy format
-const MAGIC_V3 = new TextEncoder().encode("SECUREV3"); // New Streaming format
+const MAGIC_BYTES = new TextEncoder().encode("SECUREV2"); // Header to identify legitimate files
 
 export interface FileMetadata {
   origin: string;
   timestamp: number;
   originalName: string;
   legitimacyToken: string;
+  totalSize: number;
 }
 
 /**
@@ -71,6 +71,8 @@ export async function encryptData(data: Uint8Array, password: string, salt?: Uin
   const usedSalt = salt || crypto.getRandomValues(new Uint8Array(SALT_SIZE));
   const iv = crypto.getRandomValues(new Uint8Array(IV_SIZE));
   
+  // For vault, we use a dummy "key file" (just the password again) to reuse deriveKey logic
+  // or we can simplify. Let's simplify for the vault case.
   const passwordBuffer = new TextEncoder().encode(password);
   const baseKey = await crypto.subtle.importKey('raw', passwordBuffer, 'PBKDF2', false, ['deriveKey']);
   const key = await crypto.subtle.deriveKey(
@@ -83,9 +85,9 @@ export async function encryptData(data: Uint8Array, password: string, salt?: Uin
 
   const encrypted = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, data);
   
-  const result = new Uint8Array(MAGIC_V2.length + usedSalt.length + iv.length + encrypted.byteLength);
+  const result = new Uint8Array(MAGIC_BYTES.length + usedSalt.length + iv.length + encrypted.byteLength);
   let offset = 0;
-  result.set(MAGIC_V2, offset); offset += MAGIC_V2.length;
+  result.set(MAGIC_BYTES, offset); offset += MAGIC_BYTES.length;
   result.set(usedSalt, offset); offset += usedSalt.length;
   result.set(iv, offset); offset += iv.length;
   result.set(new Uint8Array(encrypted), offset);
@@ -97,11 +99,10 @@ export async function encryptData(data: Uint8Array, password: string, salt?: Uin
  * Generic decryption for small data
  */
 export async function decryptData(encryptedData: Uint8Array, password: string): Promise<Uint8Array> {
-  const magic = encryptedData.slice(0, MAGIC_V2.length);
-  const magicStr = new TextDecoder().decode(magic);
-  if (magicStr !== "SECUREV2" && magicStr !== "SECUREV3") throw new Error("Invalid Source");
+  const magic = encryptedData.slice(0, MAGIC_BYTES.length);
+  if (new TextDecoder().decode(magic) !== "SECUREV2") throw new Error("Invalid Source");
 
-  let offset = MAGIC_V2.length;
+  let offset = MAGIC_BYTES.length;
   const salt = encryptedData.slice(offset, offset + SALT_SIZE); offset += SALT_SIZE;
   const iv = encryptedData.slice(offset, offset + IV_SIZE); offset += IV_SIZE;
   const content = encryptedData.slice(offset);
@@ -134,7 +135,8 @@ export async function encryptFile(
     origin: "SecureFile Crypt Authenticated",
     timestamp: Date.now(),
     originalName: targetFile.name,
-    legitimacyToken: crypto.randomUUID()
+    legitimacyToken: crypto.randomUUID(),
+    totalSize: targetFile.size
   };
   
   const targetData = await readFileWithProgress(targetFile, onProgress);
@@ -154,11 +156,11 @@ export async function encryptFile(
   if (onProgress) onProgress(100);
 
   const metaLen = new Uint32Array([encMeta.byteLength]);
-  const totalSize = MAGIC_V2.length + salt.length + iv.length + 4 + encMeta.byteLength + encContent.byteLength;
+  const totalSize = MAGIC_BYTES.length + salt.length + iv.length + 4 + encMeta.byteLength + encContent.byteLength;
   const result = new Uint8Array(totalSize);
 
   let offset = 0;
-  result.set(MAGIC_V2, offset); offset += MAGIC_V2.length;
+  result.set(MAGIC_BYTES, offset); offset += MAGIC_BYTES.length;
   result.set(salt, offset); offset += salt.length;
   result.set(iv, offset); offset += iv.length;
   result.set(new Uint8Array(metaLen.buffer), offset); offset += 4;
@@ -177,12 +179,12 @@ export async function decryptFile(
   const fullDataRaw = await readFileWithProgress(encryptedBlob, onProgress);
   const fullData = new Uint8Array(fullDataRaw);
   
-  const magic = fullData.slice(0, MAGIC_V2.length);
+  const magic = fullData.slice(0, MAGIC_BYTES.length);
   if (new TextDecoder().decode(magic) !== "SECUREV2") {
     throw new Error("Invalid Source");
   }
 
-  let offset = MAGIC_V2.length;
+  let offset = MAGIC_BYTES.length;
   const salt = fullData.slice(offset, offset + SALT_SIZE); offset += SALT_SIZE;
   const iv = fullData.slice(offset, offset + IV_SIZE); offset += IV_SIZE;
   const metaLen = new Uint32Array(fullData.slice(offset, offset + 4).buffer)[0]; offset += 4;
@@ -196,6 +198,10 @@ export async function decryptFile(
     const meta: FileMetadata = JSON.parse(new TextDecoder().decode(decMetaBuf));
     const decContent = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, encContent);
     
+    if (decContent.byteLength !== meta.totalSize) {
+      throw new Error("Integrity Failure: File size mismatch");
+    }
+
     if (onProgress) onProgress(100);
     return { data: new Uint8Array(decContent), meta };
   } catch (error) {
@@ -222,7 +228,8 @@ export async function encryptFileStream(
     origin: "SecureFile Crypt Authenticated (Stream)",
     timestamp: Date.now(),
     originalName: targetFile.name,
-    legitimacyToken: crypto.randomUUID()
+    legitimacyToken: crypto.randomUUID(),
+    totalSize: targetFile.size
   };
 
   const encMeta = await crypto.subtle.encrypt(
@@ -244,7 +251,7 @@ export async function encryptFileStream(
   return new ReadableStream({
     async start(controller) {
       // Write Header
-      controller.enqueue(MAGIC_V3);
+      controller.enqueue(MAGIC_BYTES);
       controller.enqueue(salt);
       controller.enqueue(initialIv);
       controller.enqueue(new Uint8Array(chunkSizeBuf.buffer));
@@ -315,27 +322,8 @@ export async function decryptFileStream(
   }
 
   // 1. Read Header
-  let { data: magic, leftover } = await readBytes(MAGIC_V3.length);
-  const magicStr = new TextDecoder().decode(magic);
-  
-  if (magicStr === "SECUREV2") {
-    // FALLBACK TO LEGACY DECRYPTION
-    // Since this is a stream, we need to read the whole file to use the old decryptFile
-    // This is the only way for legacy files.
-    const fullFile = await encryptedFile.arrayBuffer();
-    const result = await decryptFile(encryptedFile, keyFile, password, onProgress);
-    return {
-      stream: new ReadableStream({
-        start(controller) {
-          controller.enqueue(result.data);
-          controller.close();
-        }
-      }),
-      meta: result.meta
-    };
-  }
-
-  if (magicStr !== "SECUREV3") throw new Error("Invalid Source");
+  let { data: magic, leftover } = await readBytes(MAGIC_BYTES.length);
+  if (new TextDecoder().decode(magic) !== "SECUREV2") throw new Error("Invalid Source");
 
   let saltRes = await readBytes(SALT_SIZE, leftover);
   const salt = saltRes.data;
@@ -365,14 +353,20 @@ export async function decryptFileStream(
   }
 
   let currentIv = incrementIV(initialIv);
-  let bytesProcessed = 0;
-  const totalSize = encryptedFile.size;
+  let decryptedBytesProcessed = 0;
+  let encryptedBytesProcessed = 0;
+  const totalEncryptedSize = encryptedFile.size;
 
   const stream = new ReadableStream({
     async pull(controller) {
       // Read next chunk length
       let chunkLenRes = await readBytes(4, streamLeftover);
       if (chunkLenRes.data.length < 4) {
+        // End of stream reached
+        if (decryptedBytesProcessed < meta.totalSize) {
+          controller.error(new Error("Integrity Failure: File is incomplete or truncated"));
+          return;
+        }
         if (onProgress) onProgress(100);
         controller.close();
         return;
@@ -390,13 +384,13 @@ export async function decryptFileStream(
           key,
           encChunk
         );
-        controller.enqueue(new Uint8Array(decryptedChunk));
+        const decryptedData = new Uint8Array(decryptedChunk);
+        controller.enqueue(decryptedData);
         
         currentIv = incrementIV(currentIv);
-        // Progress is a bit tricky here because we don't know the exact original size easily 
-        // without storing it in meta, but we can use the encrypted file size as a proxy.
-        bytesProcessed += chunkLen + 4; 
-        if (onProgress) onProgress(Math.min(99, Math.round((bytesProcessed / totalSize) * 100)));
+        decryptedBytesProcessed += decryptedData.length;
+        encryptedBytesProcessed += chunkLen + 4; 
+        if (onProgress) onProgress(Math.min(99, Math.round((encryptedBytesProcessed / totalEncryptedSize) * 100)));
       } catch (e) {
         controller.error(new Error("Integrity Failure"));
       }
