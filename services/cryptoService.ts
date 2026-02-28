@@ -37,12 +37,32 @@ async function readFileWithProgress(file: File, onProgress?: (percent: number) =
   });
 }
 
+async function hashFileStreaming(file: File): Promise<Uint8Array> {
+  const CHUNK_SIZE_HASH = 1024 * 1024; // 1MB chunks
+  let currentHash = new Uint8Array(32); // Initial seed (SHA-256 size)
+  let offset = 0;
+  
+  while (offset < file.size) {
+    const chunk = file.slice(offset, offset + CHUNK_SIZE_HASH);
+    const buffer = await chunk.arrayBuffer();
+    const dataToHash = new Uint8Array(currentHash.length + buffer.byteLength);
+    dataToHash.set(currentHash);
+    dataToHash.set(new Uint8Array(buffer), currentHash.length);
+    
+    const hashBuffer = await crypto.subtle.digest('SHA-256', dataToHash);
+    currentHash = new Uint8Array(hashBuffer);
+    offset += CHUNK_SIZE_HASH;
+  }
+  
+  return currentHash;
+}
+
 async function deriveKey(keyFile: File, password: string, salt: Uint8Array): Promise<CryptoKey> {
-  const fileBuffer = await keyFile.arrayBuffer();
+  const keyFileHash = await hashFileStreaming(keyFile);
   const passwordBuffer = new TextEncoder().encode(password);
-  const combined = new Uint8Array(fileBuffer.byteLength + passwordBuffer.byteLength);
-  combined.set(new Uint8Array(fileBuffer), 0);
-  combined.set(passwordBuffer, fileBuffer.byteLength);
+  const combined = new Uint8Array(keyFileHash.length + passwordBuffer.byteLength);
+  combined.set(keyFileHash, 0);
+  combined.set(passwordBuffer, keyFileHash.length);
 
   const baseKey = await crypto.subtle.importKey('raw', combined, 'PBKDF2', false, ['deriveKey']);
 
@@ -260,40 +280,74 @@ export async function encryptFileStream(
     },
 
     async pull(controller) {
-      const { done, value } = await reader.read();
-      
-      if (done) {
-        if (onProgress) onProgress(100);
-        controller.close();
-        return;
+      try {
+        const { done, value } = await reader.read();
+        
+        if (done) {
+          if (onProgress) onProgress(100);
+          controller.close();
+          reader.releaseLock();
+          return;
+        }
+
+        const encryptedChunk = await crypto.subtle.encrypt(
+          { name: 'AES-GCM', iv: currentIv },
+          key,
+          value
+        );
+
+        const chunkLenBuf = new Uint32Array([encryptedChunk.byteLength]);
+        controller.enqueue(new Uint8Array(chunkLenBuf.buffer));
+        controller.enqueue(new Uint8Array(encryptedChunk));
+
+        currentIv = incrementIV(currentIv);
+        bytesProcessed += value.byteLength;
+        if (onProgress) onProgress(Math.round((bytesProcessed / totalSize) * 100));
+      } catch (e) {
+        reader.releaseLock();
+        controller.error(e);
       }
-
-      // SubtleCrypto encrypts the whole chunk. 
-      // If the chunk from the file stream is not exactly CHUNK_SIZE, it's fine (last chunk).
-      // However, usually ReadableStream gives chunks of varying sizes.
-      // We should ideally buffer them to CHUNK_SIZE for consistency, but AES-GCM works on any size.
-      // To keep it simple, we encrypt whatever the reader gives us.
-      
-      const encryptedChunk = await crypto.subtle.encrypt(
-        { name: 'AES-GCM', iv: currentIv },
-        key,
-        value
-      );
-
-      // Each chunk in the stream will be: [CHUNK_ENC_LEN (4B)][ENC_DATA_WITH_TAG]
-      const chunkLenBuf = new Uint32Array([encryptedChunk.byteLength]);
-      controller.enqueue(new Uint8Array(chunkLenBuf.buffer));
-      controller.enqueue(new Uint8Array(encryptedChunk));
-
-      currentIv = incrementIV(currentIv);
-      bytesProcessed += value.byteLength;
-      if (onProgress) onProgress(Math.round((bytesProcessed / totalSize) * 100));
     },
 
     cancel() {
       reader.cancel();
+      reader.releaseLock();
     }
   });
+}
+
+// Helper to read exactly N bytes from the stream efficiently
+async function readBytes(reader: ReadableStreamDefaultReader<Uint8Array>, n: number, existingBuffer: Uint8Array | null = null): Promise<{ data: Uint8Array, leftover: Uint8Array | null }> {
+  if (existingBuffer && existingBuffer.length >= n) {
+    return { 
+      data: existingBuffer.slice(0, n), 
+      leftover: existingBuffer.length > n ? existingBuffer.slice(n) : null 
+    };
+  }
+
+  let result = existingBuffer || new Uint8Array(0);
+  
+  try {
+    while (result.length < n) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      
+      const newResult = new Uint8Array(result.length + value.length);
+      newResult.set(result);
+      newResult.set(value, result.length);
+      result = newResult;
+    }
+    
+    const data = result.slice(0, n);
+    const leftover = result.length > n ? result.slice(n) : null;
+    
+    // Help GC
+    result = null as any;
+    
+    return { data, leftover };
+  } catch (e) {
+    throw e;
+  }
 }
 
 export async function decryptFileStream(
@@ -303,104 +357,99 @@ export async function decryptFileStream(
   onProgress?: (percent: number) => void
 ): Promise<{ stream: ReadableStream, meta: FileMetadata }> {
   const reader = encryptedFile.stream().getReader();
+  let streamLeftover: Uint8Array | null = null;
   
-  // Helper to read exactly N bytes from the stream
-  async function readBytes(n: number, existingBuffer: Uint8Array | null = null): Promise<{ data: Uint8Array, leftover: Uint8Array | null }> {
-    let result = existingBuffer || new Uint8Array(0);
-    while (result.length < n) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      const newResult = new Uint8Array(result.length + value.length);
-      newResult.set(result);
-      newResult.set(value, result.length);
-      result = newResult;
-    }
-    return { 
-      data: result.slice(0, n), 
-      leftover: result.length > n ? result.slice(n) : null 
-    };
-  }
-
-  // 1. Read Header
-  let { data: magic, leftover } = await readBytes(MAGIC_BYTES.length);
-  if (new TextDecoder().decode(magic) !== "SECUREV2") throw new Error("Invalid Source");
-
-  let saltRes = await readBytes(SALT_SIZE, leftover);
-  const salt = saltRes.data;
-  
-  let ivRes = await readBytes(IV_SIZE, saltRes.leftover);
-  const initialIv = ivRes.data;
-
-  let chunkSizeRes = await readBytes(4, ivRes.leftover);
-  // We don't strictly need CHUNK_SIZE for decryption if we store individual chunk lengths, 
-  // but it's good for metadata.
-  
-  let metaLenRes = await readBytes(4, chunkSizeRes.leftover);
-  const metaLen = new Uint32Array(metaLenRes.data.buffer)[0];
-
-  let encMetaRes = await readBytes(metaLen, metaLenRes.leftover);
-  const encMeta = encMetaRes.data;
-  let streamLeftover = encMetaRes.leftover;
-
-  const key = await deriveKey(keyFile, password, salt);
-
-  let meta: FileMetadata;
   try {
-    const decMetaBuf = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: initialIv }, key, encMeta);
-    meta = JSON.parse(new TextDecoder().decode(decMetaBuf));
-  } catch (e) {
-    throw new Error("Integrity Failure");
-  }
+    // 1. Read Header
+    let magicRes = await readBytes(reader, MAGIC_BYTES.length, streamLeftover);
+    if (new TextDecoder().decode(magicRes.data) !== "SECUREV2") throw new Error("Invalid Source");
+    streamLeftover = magicRes.leftover;
 
-  let currentIv = incrementIV(initialIv);
-  let decryptedBytesProcessed = 0;
-  let encryptedBytesProcessed = 0;
-  const totalEncryptedSize = encryptedFile.size;
+    let saltRes = await readBytes(reader, SALT_SIZE, streamLeftover);
+    const salt = saltRes.data;
+    streamLeftover = saltRes.leftover;
+    
+    let ivRes = await readBytes(reader, IV_SIZE, streamLeftover);
+    const initialIv = ivRes.data;
+    streamLeftover = ivRes.leftover;
 
-  const stream = new ReadableStream({
-    async pull(controller) {
-      // Read next chunk length
-      let chunkLenRes = await readBytes(4, streamLeftover);
-      if (chunkLenRes.data.length < 4) {
-        // End of stream reached
-        if (decryptedBytesProcessed < meta.totalSize) {
-          controller.error(new Error("Integrity Failure: File is incomplete or truncated"));
-          return;
-        }
-        if (onProgress) onProgress(100);
-        controller.close();
-        return;
-      }
-      const chunkLen = new Uint32Array(chunkLenRes.data.buffer)[0];
-      
-      // Read the encrypted chunk
-      let encChunkRes = await readBytes(chunkLen, chunkLenRes.leftover);
-      const encChunk = encChunkRes.data;
-      streamLeftover = encChunkRes.leftover;
+    let chunkSizeRes = await readBytes(reader, 4, streamLeftover);
+    streamLeftover = chunkSizeRes.leftover;
+    
+    let metaLenRes = await readBytes(reader, 4, streamLeftover);
+    const metaLen = new Uint32Array(metaLenRes.data.buffer)[0];
+    streamLeftover = metaLenRes.leftover;
 
-      try {
-        const decryptedChunk = await crypto.subtle.decrypt(
-          { name: 'AES-GCM', iv: currentIv },
-          key,
-          encChunk
-        );
-        const decryptedData = new Uint8Array(decryptedChunk);
-        controller.enqueue(decryptedData);
-        
-        currentIv = incrementIV(currentIv);
-        decryptedBytesProcessed += decryptedData.length;
-        encryptedBytesProcessed += chunkLen + 4; 
-        if (onProgress) onProgress(Math.min(99, Math.round((encryptedBytesProcessed / totalEncryptedSize) * 100)));
-      } catch (e) {
-        controller.error(new Error("Integrity Failure"));
-      }
-    },
-    cancel() {
-      reader.cancel();
+    let encMetaRes = await readBytes(reader, metaLen, streamLeftover);
+    const encMeta = encMetaRes.data;
+    streamLeftover = encMetaRes.leftover;
+
+    const key = await deriveKey(keyFile, password, salt);
+
+    let meta: FileMetadata;
+    try {
+      const decMetaBuf = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: initialIv }, key, encMeta);
+      meta = JSON.parse(new TextDecoder().decode(decMetaBuf));
+    } catch (e) {
+      throw new Error("Integrity Failure");
     }
-  });
 
-  return { stream, meta };
+    let currentIv = incrementIV(initialIv);
+    let decryptedBytesProcessed = 0;
+    let encryptedBytesProcessed = 0;
+    const totalEncryptedSize = encryptedFile.size;
+
+    const stream = new ReadableStream({
+      async pull(controller) {
+        try {
+          // Read next chunk length
+          let chunkLenRes = await readBytes(reader, 4, streamLeftover);
+          if (chunkLenRes.data.length < 4) {
+            if (decryptedBytesProcessed < meta.totalSize) {
+              controller.error(new Error("Integrity Failure: File is incomplete or truncated"));
+              return;
+            }
+            if (onProgress) onProgress(100);
+            controller.close();
+            reader.releaseLock();
+            return;
+          }
+          const chunkLen = new Uint32Array(chunkLenRes.data.buffer)[0];
+          streamLeftover = chunkLenRes.leftover;
+          
+          // Read the encrypted chunk
+          let encChunkRes = await readBytes(reader, chunkLen, streamLeftover);
+          const encChunk = encChunkRes.data;
+          streamLeftover = encChunkRes.leftover;
+
+          const decryptedChunk = await crypto.subtle.decrypt(
+            { name: 'AES-GCM', iv: currentIv },
+            key,
+            encChunk
+          );
+          const decryptedData = new Uint8Array(decryptedChunk);
+          controller.enqueue(decryptedData);
+          
+          currentIv = incrementIV(currentIv);
+          decryptedBytesProcessed += decryptedData.length;
+          encryptedBytesProcessed += chunkLen + 4; 
+          if (onProgress) onProgress(Math.min(99, Math.round((encryptedBytesProcessed / totalEncryptedSize) * 100)));
+        } catch (e) {
+          reader.releaseLock();
+          controller.error(e);
+        }
+      },
+      cancel() {
+        reader.cancel();
+        reader.releaseLock();
+      }
+    });
+
+    return { stream, meta };
+  } catch (e) {
+    reader.releaseLock();
+    throw e;
+  }
 }
 
 /**
@@ -451,15 +500,20 @@ export async function writeDataToDestination(
   // Legacy fallback for non-streaming or if handle fails
   let blob: Blob;
   if (data instanceof ReadableStream) {
-    // This is the "bad" case for RAM, but necessary for legacy browsers
-    const chunks = [];
+    // RAM Spike Warning: This buffers everything in memory.
+    // We should warn the user if the file is large.
+    const chunks: Uint8Array[] = [];
     const reader = data.getReader();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+      }
+      blob = new Blob(chunks, { type: mimeType });
+    } finally {
+      reader.releaseLock();
     }
-    blob = new Blob(chunks, { type: mimeType });
   } else {
     blob = data instanceof Blob ? data : new Blob([data], { type: mimeType });
   }
@@ -468,7 +522,13 @@ export async function writeDataToDestination(
   const a = document.createElement('a');
   a.style.display = 'none'; a.href = url; a.download = suggestedName;
   document.body.appendChild(a); a.click();
-  window.URL.revokeObjectURL(url); document.body.removeChild(a);
+  
+  // Cleanup
+  setTimeout(() => {
+    window.URL.revokeObjectURL(url);
+    document.body.removeChild(a);
+    blob = null as any;
+  }, 100);
 }
 
 export function generateRandomKeyFile(): File {
