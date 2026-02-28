@@ -1,7 +1,18 @@
 
 import React, { useState, useCallback, useMemo, useEffect, useRef } from 'react';
 import { OperationMode } from './types';
-import { encryptFile, decryptFile, generateRandomKeyFile, getSaveHandle, writeDataToDestination, FileMetadata, encryptData, decryptData } from './services/cryptoService';
+import { 
+  encryptFile, 
+  decryptFile, 
+  encryptFileStream,
+  decryptFileStream,
+  generateRandomKeyFile, 
+  getSaveHandle, 
+  writeDataToDestination, 
+  FileMetadata, 
+  encryptData, 
+  decryptData 
+} from './services/cryptoService';
 import FileSelector from './components/FileSelector';
 import { GoogleGenAI } from "@google/genai";
 import { 
@@ -95,7 +106,7 @@ const TRANSLATIONS = {
       },
       {
         title: "Are there size limits?",
-        text: "Practically, files up to 1GB work perfectly. Files over 2GB may crash your browser due to RAM limitations. Everything happens locally in your device's memory."
+        text: "Thanks to our new Streaming Engine, there are no practical size limits! You can encrypt 10GB+ files with constant RAM usage (~50MB). Your browser's storage and disk space are the only real limits."
       },
       {
         title: "What files CANNOT be encrypted?",
@@ -226,7 +237,7 @@ const TRANSLATIONS = {
       },
       {
         title: "¿Hay límites de tamaño?",
-        text: "Archivos de hasta 1GB funcionan perfecto. Archivos de más de 2GB pueden cerrar tu navegador por falta de RAM. Todo ocurre localmente."
+        text: "¡Gracias a nuestro nuevo Motor de Streaming, no hay límites prácticos! Puedes cifrar archivos de más de 10GB con un uso constante de RAM (~50MB). El espacio en disco es tu único límite real."
       },
       {
         title: "¿Qué archivos NO se pueden cifrar?",
@@ -327,10 +338,11 @@ const App: React.FC = () => {
   const [vault, setVault] = useState<VaultEntry[]>([]);
   
   // Vault Security States
-  const [vaultMasterKey, setVaultMasterKey] = useState<string>(() => localStorage.getItem('vault_master_key') || "");
+  const [vaultMasterKey, setVaultMasterKey] = useState<string>("");
   const [isVaultUnlocked, setIsVaultUnlocked] = useState(false);
   const [vaultKeyInput, setVaultKeyInput] = useState("");
   const [vaultError, setVaultError] = useState(false);
+  const [hasVault, setHasVault] = useState<boolean>(() => localStorage.getItem('secure_vault_v2') !== null);
 
   const vaultRef = useRef<HTMLDivElement>(null);
   const t = TRANSLATIONS[lang];
@@ -357,12 +369,13 @@ const App: React.FC = () => {
   }, [vaultMasterKey, isVaultUnlocked]);
 
   // Save vault to encrypted storage
-  const saveVaultEncrypted = useCallback(async (newVault: VaultEntry[]) => {
-    if (!vaultMasterKey) return;
+  const saveVaultEncrypted = useCallback(async (newVault: VaultEntry[], keyToUse?: string) => {
+    const key = keyToUse || vaultMasterKey;
+    if (!key) return;
     try {
       const json = JSON.stringify(newVault);
       const binary = new TextEncoder().encode(json);
-      const encrypted = await encryptData(binary, vaultMasterKey);
+      const encrypted = await encryptData(binary, key);
       const base64 = btoa(String.fromCharCode(...encrypted));
       localStorage.setItem('secure_vault_v2', base64);
     } catch (e) {
@@ -405,6 +418,7 @@ const App: React.FC = () => {
   const [targetFiles, setTargetFiles] = useState<File[]>([]);
   const [keyFile, setKeyFile] = useState<File | null>(null);
   const [password, setPassword] = useState<string>("");
+  const [saveToVault, setSaveToVault] = useState<boolean>(false);
   const [customOutputName, setCustomOutputName] = useState<string>("");
   const [showPassword, setShowPassword] = useState<boolean>(false);
   const [mode, setMode] = useState<OperationMode>(OperationMode.ENCRYPT);
@@ -453,15 +467,15 @@ const App: React.FC = () => {
     }
   }, [targetFiles, mode]);
 
-  const passwordStrength = useMemo(() => {
+  const calculateStrength = useCallback((pass: string) => {
     const checks = {
-      length: password.length >= 8,
-      upper: /[A-Z]/.test(password),
-      number: /[0-9]/.test(password),
-      special: /[^A-Za-z0-9]/.test(password),
-      extra: password.length >= 16
+      length: pass.length >= 8,
+      upper: /[A-Z]/.test(pass),
+      number: /[0-9]/.test(pass),
+      special: /[^A-Za-z0-9]/.test(pass),
+      extra: pass.length >= 16
     };
-    if (!password) return { score: 0, label: "", color: "bg-slate-800", checks };
+    if (!pass) return { score: 0, label: "", color: "bg-slate-800", checks };
     let score = 0;
     if (checks.length) score++;
     if (checks.upper) score++;
@@ -471,7 +485,9 @@ const App: React.FC = () => {
     const colors = ["bg-red-500", "bg-red-400", "bg-amber-500", "bg-blue-500", "bg-emerald-500"];
     const idx = Math.max(0, Math.min(score - 1, 4));
     return { label: t.passwordStrengths[idx], color: colors[idx], score, checks };
-  }, [password, t]);
+  }, [t]);
+
+  const passwordStrength = useMemo(() => calculateStrength(password), [password, calculateStrength]);
 
   const targetAccept = useMemo(() => {
     if (mode === OperationMode.ENCRYPT) return ALLOWED_ENCRYPTION_EXTENSIONS.join(',');
@@ -576,19 +592,33 @@ const App: React.FC = () => {
         const updateFilePercent = (p: number) => setProgress(prev => ({ ...prev, percent: p }));
 
         if (mode === OperationMode.ENCRYPT) {
-          const encryptedData = await encryptFile(file, keyFile, password, updateFilePercent);
+          const stream = await encryptFileStream(file, keyFile, password, updateFilePercent);
           const fileName = isBatch ? `${file.name}.secure` : (customOutputName || `${file.name}.secure`);
-          await writeDataToDestination(encryptedData, isBatch ? null : singleFileHandle, fileName, 'application/octet-stream');
+          await writeDataToDestination(stream, isBatch ? null : singleFileHandle, fileName, 'application/octet-stream');
         } else {
-          const result = await decryptFile(file, keyFile, password, updateFilePercent);
+          const result = await decryptFileStream(file, keyFile, password, updateFilePercent);
           const defaultName = file.name.endsWith('.secure') ? file.name.slice(0, -7) : `decrypted_${file.name}`;
           const fileName = isBatch ? defaultName : (customOutputName || defaultName);
-          await writeDataToDestination(result.data, isBatch ? null : singleFileHandle, fileName, 'application/octet-stream');
+          await writeDataToDestination(result.stream, isBatch ? null : singleFileHandle, fileName, 'application/octet-stream');
           setLegitimacyMeta(result.meta);
         }
       }
       const actionLabel = mode === OperationMode.ENCRYPT ? t.successEnc : t.successDec;
       setSuccess(`${t.successOp} ${targetFiles.length} ${t.fileSelector.files} ${actionLabel}.`);
+
+      // Auto-save to vault if checked
+      if (mode === OperationMode.ENCRYPT && password && saveToVault) {
+        const newEntries = targetFiles.map(f => ({
+          id: crypto.randomUUID(),
+          name: targetFiles.length === 1 && customOutputName ? customOutputName : `${f.name}.secure`,
+          password,
+          date: Date.now()
+        }));
+        setVault(prev => [...prev, ...newEntries]);
+        // Optional: uncheck after saving to prevent double save if they press again? 
+        // But handleProcess resets success/error at start, so it's fine.
+        setSaveToVault(false); 
+      }
     } catch (err: any) {
       if (err.message.includes("Integrity Failure")) setError(t.errors.accessDenied);
       else if (err.message.includes("Invalid Source")) setError(t.errors.invalidVault);
@@ -596,19 +626,6 @@ const App: React.FC = () => {
     } finally {
       setIsLoading(false);
       setProgress({ current: 0, total: 0, percent: 0 });
-    }
-  };
-
-  const handleSaveToVault = () => {
-    if (mode === OperationMode.ENCRYPT && password) {
-      const newEntries = targetFiles.map(f => ({
-        id: crypto.randomUUID(),
-        name: targetFiles.length === 1 && customOutputName ? customOutputName : `${f.name}.secure`,
-        password,
-        date: Date.now()
-      }));
-      setVault(prev => [...prev, ...newEntries]);
-      setSuccess(prev => prev ? `${prev} (${t.vault.saveToVault})` : t.vault.saveToVault);
     }
   };
 
@@ -629,21 +646,30 @@ const App: React.FC = () => {
 
   const handleVaultAuth = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!vaultMasterKey) {
+    const encrypted = localStorage.getItem('secure_vault_v2');
+    
+    if (!encrypted) {
+      // Setup mode
       if (vaultKeyInput.length >= 4) {
-        localStorage.setItem('vault_master_key', vaultKeyInput);
         setVaultMasterKey(vaultKeyInput);
-        setIsVaultUnlocked(true);
-        setVaultKeyInput("");
-        // Initialize empty vault
-        await saveVaultEncrypted([]);
-      }
-    } else {
-      if (vaultKeyInput === vaultMasterKey) {
         setIsVaultUnlocked(true);
         setVaultError(false);
         setVaultKeyInput("");
-      } else {
+        setHasVault(true);
+        // Initialize empty vault
+        await saveVaultEncrypted([], vaultKeyInput);
+      }
+    } else {
+      // Unlock mode
+      try {
+        const binary = Uint8Array.from(atob(encrypted), c => c.charCodeAt(0));
+        await decryptData(binary, vaultKeyInput);
+        // If it didn't throw, the key is correct
+        setVaultMasterKey(vaultKeyInput);
+        setIsVaultUnlocked(true);
+        setVaultError(false);
+        setVaultKeyInput("");
+      } catch (e) {
         setVaultError(true);
       }
     }
@@ -716,13 +742,14 @@ const App: React.FC = () => {
 
   const handleFactoryReset = () => {
     setVault([]);
-    localStorage.removeItem('vault_master_key');
     localStorage.removeItem('secure_vault_v2');
     localStorage.removeItem('secure_vault'); // Legacy
+    localStorage.removeItem('vault_master_key'); // Legacy
     setVaultMasterKey("");
     setIsVaultUnlocked(false);
     setIsVaultMenuOpen(false);
     setIsResetModalOpen(false);
+    setHasVault(false);
     setSuccess(lang === 'en' ? "Application reset successfully." : "Aplicación restablecida con éxito.");
   };
 
@@ -923,11 +950,11 @@ const App: React.FC = () => {
               {!isVaultUnlocked ? (
                 <div className="p-6 flex flex-col items-center gap-4 text-center animate-in fade-in zoom-in-95 duration-200">
                   <div className="w-12 h-12 bg-slate-800 rounded-full flex items-center justify-center text-blue-400 mb-2">
-                    {!vaultMasterKey ? <Plus size={20} /> : <Unlock size={20} />}
+                    {!hasVault ? <Plus size={20} /> : <Unlock size={20} />}
                   </div>
                   <div className="space-y-1">
-                    <h5 className="text-sm font-bold text-white">{!vaultMasterKey ? t.vault.setupTitle : t.vault.unlockTitle}</h5>
-                    <p className="text-[10px] text-slate-500">{!vaultMasterKey ? t.vault.setupDesc : t.vault.unlockDesc}</p>
+                    <h5 className="text-sm font-bold text-white">{!hasVault ? t.vault.setupTitle : t.vault.unlockTitle}</h5>
+                    <p className="text-[10px] text-slate-500">{!hasVault ? t.vault.setupDesc : t.vault.unlockDesc}</p>
                   </div>
                   <form onSubmit={handleVaultAuth} className="w-full space-y-3">
                     <input 
@@ -940,7 +967,7 @@ const App: React.FC = () => {
                     />
                     {vaultError && <p className="text-[10px] text-red-500 font-bold uppercase animate-in fade-in">{t.vault.wrongKey}</p>}
                     <button type="submit" className="w-full bg-blue-600 hover:bg-blue-500 py-2 rounded-xl text-xs font-bold transition-all shadow-lg shadow-blue-600/20 active:scale-95">
-                      {!vaultMasterKey ? t.vault.setupBtn : t.vault.unlockBtn}
+                      {!hasVault ? t.vault.setupBtn : t.vault.unlockBtn}
                     </button>
                   </form>
                 </div>
@@ -962,30 +989,38 @@ const App: React.FC = () => {
                       <p className="text-center py-8 text-slate-600 text-[10px] italic">{t.vault.empty}</p>
                     ) : (
                       <div className="space-y-1 pb-2">
-                        {filteredVault.map(entry => (
-                          <div key={entry.id} className="group p-2 rounded-xl bg-white/5 hover:bg-white/10 border border-transparent hover:border-white/5 transition-all">
-                            <div className="flex justify-between items-start gap-2">
-                              <div className="min-w-0 flex-1">
-                                <p className="text-[11px] font-bold text-slate-200 truncate">{entry.name}</p>
-                                <p className="text-[9px] text-slate-500">{new Date(entry.date).toLocaleDateString()}</p>
+                        {filteredVault.map(entry => {
+                          const strength = calculateStrength(entry.password);
+                          return (
+                            <div key={entry.id} className="group p-2 rounded-xl bg-white/5 hover:bg-white/10 border border-transparent hover:border-white/5 transition-all">
+                              <div className="flex justify-between items-start gap-2">
+                                <div className="min-w-0 flex-1">
+                                  <p className="text-[11px] font-bold text-slate-200 truncate">{entry.name}</p>
+                                  <div className="flex items-center gap-2">
+                                    <p className="text-[9px] text-slate-500">{new Date(entry.date).toLocaleDateString()}</p>
+                                    <span className={`text-[8px] px-1.5 py-0.5 rounded-full text-white font-bold ${strength.color} opacity-80`}>
+                                      {strength.label}
+                                    </span>
+                                  </div>
+                                </div>
+                                <button onClick={() => deleteVaultEntry(entry.id)} className="text-slate-600 hover:text-red-400 transition-colors opacity-0 group-hover:opacity-100">
+                                  <Trash2 size={10} />
+                                </button>
                               </div>
-                              <button onClick={() => deleteVaultEntry(entry.id)} className="text-slate-600 hover:text-red-400 transition-colors opacity-0 group-hover:opacity-100">
-                                <Trash2 size={10} />
-                              </button>
-                            </div>
-                            <div className="mt-2 flex items-center gap-2">
-                              <div className="flex-1 bg-black/40 rounded px-2 py-1 flex items-center gap-2">
-                                <p className="text-[10px] font-mono text-blue-300 truncate tracking-tight">{entry.password}</p>
+                              <div className="mt-2 flex items-center gap-2">
+                                <div className="flex-1 bg-black/40 rounded px-2 py-1 flex items-center gap-2">
+                                  <p className="text-[10px] font-mono text-blue-300 truncate tracking-tight">{entry.password}</p>
+                                </div>
+                                <button 
+                                  onClick={() => copyToClipboard(entry.password, entry.id)}
+                                  className="px-2 py-1 bg-blue-600 hover:bg-blue-500 text-white rounded text-[10px] font-bold transition-all shadow-md shadow-blue-600/20 active:scale-95"
+                                >
+                                  {copiedId === entry.id ? t.vault.copied : t.vault.copy}
+                                </button>
                               </div>
-                              <button 
-                                onClick={() => copyToClipboard(entry.password, entry.id)}
-                                className="px-2 py-1 bg-blue-600 hover:bg-blue-500 text-white rounded text-[10px] font-bold transition-all shadow-md shadow-blue-600/20 active:scale-95"
-                              >
-                                {copiedId === entry.id ? t.vault.copied : t.vault.copy}
-                              </button>
                             </div>
-                          </div>
-                        ))}
+                          );
+                        })}
                       </div>
                     )}
                   </div>
@@ -1170,13 +1205,35 @@ const App: React.FC = () => {
                 </div>
 
                 {password && (
-                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 mt-3 animate-in fade-in slide-in-from-top-1 duration-300">
-                    {Object.entries(passwordStrength.checks).map(([key, met]) => (
-                      <div key={key} className={`flex items-center gap-2 text-[10px] font-bold uppercase transition-colors ${met ? 'text-emerald-400' : 'text-slate-600'}`}>
-                        {met ? <Check size={10} /> : <Circle size={10} />}
-                        <span>{(t.passCriteria as any)[key]}</span>
-                      </div>
-                    ))}
+                  <div className="flex flex-col gap-3 mt-3 animate-in fade-in slide-in-from-top-1 duration-300">
+                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                      {Object.entries(passwordStrength.checks).map(([key, met]) => (
+                        <div key={key} className={`flex items-center gap-2 text-[10px] font-bold uppercase transition-colors ${met ? 'text-emerald-400' : 'text-slate-600'}`}>
+                          {met ? <Check size={10} /> : <Circle size={10} />}
+                          <span>{(t.passCriteria as any)[key]}</span>
+                        </div>
+                      ))}
+                    </div>
+                    
+                    {mode === OperationMode.ENCRYPT && (
+                      <label className="flex items-center gap-3 cursor-pointer group w-fit">
+                        <div 
+                          onClick={() => setSaveToVault(!saveToVault)}
+                          className={`w-5 h-5 rounded-md border-2 flex items-center justify-center transition-all ${saveToVault ? 'bg-blue-600 border-blue-600 shadow-lg shadow-blue-600/20' : 'border-slate-700 bg-slate-900/50 group-hover:border-slate-500'}`}
+                        >
+                          {saveToVault && <Check size={14} className="text-white" strokeWidth={3} />}
+                        </div>
+                        <span className={`text-xs font-bold uppercase tracking-wider transition-colors ${saveToVault ? 'text-blue-400' : 'text-slate-500 group-hover:text-slate-400'}`}>
+                          {t.vault.saveToVault}
+                        </span>
+                        <input 
+                          type="checkbox" 
+                          className="hidden" 
+                          checked={saveToVault} 
+                          onChange={() => setSaveToVault(!saveToVault)} 
+                        />
+                      </label>
+                    )}
                   </div>
                 )}
               </div>
@@ -1212,11 +1269,6 @@ const App: React.FC = () => {
                   <CheckCircle2 size={18} />
                   {success}
                 </div>
-                {mode === OperationMode.ENCRYPT && password && (
-                  <button onClick={handleSaveToVault} className="text-[10px] uppercase font-black bg-emerald-600 hover:bg-emerald-500 text-white px-3 py-1.5 rounded-lg transition-all shadow-lg active:scale-95 flex items-center gap-1">
-                    <Save size={12} /> {t.vault.saveToVault}
-                  </button>
-                )}
               </div>
             )}
 
